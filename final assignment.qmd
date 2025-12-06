@@ -1,0 +1,1110 @@
+---
+title: "Assignment 3"
+author: "Hongyuan Guo, Zihui Zhao, Alex Wong"
+date: today
+format: pdf
+echo: false
+eval: true
+warning: false
+error: false
+cache: true
+tidy: true
+markdown: 
+wrap: none
+---
+### Introduction
+Our group decided to model whether or not a given action was a strike or a protest. We decided to run 3 types of models- Logistic regression, Elastic Net regression and Random Forest regression, and ultimately we decided to draw our conclusions from the Elastic Net regression due to the balance between model performance and interpretability that it provided. The main conclusion was that our models were highly predictive, with test set AUCs around 0.96 to 0.97, and that asides from one-hot encoded variables for states, the variables with the highest coefficient in predicting whether an action was a strike or a protest were action duration and whether or not an action was authorised.
+
+### Data processing and unit of analysis
+
+```{r}
+#| echo: False
+#| results: hide
+# Essential libraries
+library(tidyverse)      # For data manipulation
+library(readxl)         # For reading Excel files
+library(here)          # For file path management
+library(janitor)       # For cleaning column names
+library(stringr)
+library(readr)
+library(sf)
+library(tigris)
+
+# Load the raw data
+labor_raw <- read_excel(
+  here("data", "raw", "labor_action_tracker_data.xlsx")
+)
+
+# Take a first look
+glimpse(labor_raw)
+```
+
+```{r}
+#| echo: False
+#| results: hide
+# ================== Libraries ==================
+library(tidyverse)      # dplyr, tidyr, ggplot2, etc.
+library(readxl)         # read_excel
+library(here)           # file paths
+library(janitor)        # clean_names
+library(stringr)        # string helpers
+library(readr)          # parse_number
+library(sf)             # spatial data
+library(tigris)         # US shapefiles
+
+options(tigris_use_cache = TRUE, tigris_class = "sf")
+
+# ================== A) Load and clean base LAT data ==================
+
+# Load the raw data
+labor_raw <- read_excel(
+  here("data", "raw", "labor_action_tracker_data.xlsx")
+)
+
+# Clean names and basic variables
+labor_clean <- labor_raw %>%
+  janitor::clean_names() %>%
+  mutate(
+    # Ensure dates
+    start_date = as.Date(start_date),
+    end_date   = as.Date(end_date),
+
+    # Outcome: Strike vs Protest
+    is_strike = factor(
+      strike_or_protest == "Strike",
+      levels = c(FALSE, TRUE),
+      labels = c("Protest", "Strike")
+    ),
+
+    # Numeric variables
+    bargaining_unit_size               = as.numeric(bargaining_unit_size),
+    approximate_number_of_participants = as.numeric(approximate_number_of_participants),
+    duration_amount                    = as.numeric(duration_amount),
+
+    # Take first industry when multiple are listed (simplification)
+    industry = str_split_i(industry, ";", 1),
+
+    # Factors
+    industry = as.factor(industry),
+    state    = as.factor(state)
+  ) %>%
+  # Drop rows with missing outcome
+  filter(!is.na(strike_or_protest))
+
+# Save a basic cleaned version
+saveRDS(
+  labor_clean,
+  here("data", "processed", "labor_clean.rds")
+)
+
+# Quick look at industry distribution
+cat("Number of unique industries after cleaning:", length(levels(labor_clean$industry)), "\n\n")
+print("Most common industries:")
+print(sort(table(labor_clean$industry), decreasing = TRUE)[1:10])
+
+# ======== B) Parse latitude/longitude (expand multi-location events) =========
+
+# Fault-tolerant parser: parse a "lat, lon" string into numeric (lat, lon) and correct common mistakes
+parse_one_latlon <- function(x) {
+  if (is.na(x) || !str_detect(x, ",")) return(c(NA_real_, NA_real_))
+  parts <- str_split(x, ",", n = 2, simplify = TRUE)
+  lat <- suppressWarnings(parse_number(parts[, 1]))
+  lon <- suppressWarnings(parse_number(parts[, 2]))
+
+  # If longitude is positive in US-like range, flip sign
+  if (!is.na(lat) && !is.na(lon) && lat >= 24 && lat <= 50 && lon > 0 && lon <= 180) {
+    lon <- -lon
+  }
+
+  # If lat/lon look swapped, swap and re-check
+  if (!is.na(lat) && !is.na(lon) &&
+      abs(lat) > abs(lon) &&
+      dplyr::between(lon, -90, 90) &&
+      dplyr::between(lat, -180, 180)) {
+
+    tmp <- lat
+    lat <- lon
+    lon <- tmp
+
+    if (lat >= 24 && lat <= 50 && lon > 0 && lon <= 180) lon <- -lon
+  }
+
+  c(lat, lon)
+}
+
+# Expand multi-location events: one row per location,
+# and keep address/city/state/zip aligned with each location
+labor_longloc <- labor_clean %>%
+  # Clean character strings and standardize "|" to ";"
+  mutate(
+    across(
+      c(latitude_longitude, address, city, state, zip_code),
+      ~ str_replace_all(str_squish(as.character(.)), "\\|", ";")
+    )
+  ) %>%
+  # Turn each of these columns into a vector-style list-column
+  mutate(
+    latlon_vec   = str_split(latitude_longitude, "\\s*;\\s*"),
+    address_vec  = str_split(address,            "\\s*;\\s*"),
+    city_vec     = str_split(city,               "\\s*;\\s*"),
+    state_vec    = str_split(state,              "\\s*;\\s*"),
+    zip_vec      = str_split(zip_code,           "\\s*;\\s*")
+  ) %>%
+  # Simultaneously unnest multiple list-columns (1st coord ↔ 1st address/city/state/zip)
+  tidyr::unnest_longer(c(latlon_vec, address_vec, city_vec, state_vec, zip_vec)) %>%
+  mutate(
+    latlon_vec  = na_if(latlon_vec,  ""),
+    address_vec = na_if(address_vec, ""),
+    city_vec    = na_if(city_vec,    ""),
+    state_vec   = na_if(state_vec,   ""),
+    zip_vec     = na_if(zip_vec,     "")
+  ) %>%
+  # Parse latitude and longitude
+  rowwise() %>%
+  mutate(
+    tmp = list(parse_one_latlon(latlon_vec)),
+    event_lat = tmp[1],
+    event_lon = tmp[2]
+  ) %>%
+  ungroup() %>%
+  select(-tmp) %>%
+  # Rename the expanded vector columns back to regular columns
+  mutate(
+    address  = address_vec,
+    city     = city_vec,
+    state    = state_vec,
+    zip_code = zip_vec
+  ) %>%
+  select(-ends_with("_vec")) %>%
+  # Drop rows where coordinates could not be parsed
+  filter(!is.na(event_lat), !is.na(event_lon)) %>%
+  # Within each id, re-index locations and count how many there are
+  group_by(id) %>%
+  mutate(
+    location_index = row_number(),   # index of this location within the event
+    n_locations    = n()             # total number of locations for this event
+  ) %>%
+  ungroup()
+
+# Check whether original number_of_locations matches expanded n_locations
+loc_check <- labor_longloc %>%
+  count(id, number_of_locations, n_locations)
+
+cat("Rows where original 'Number of Locations' != expanded n_locations:\n")
+print(loc_check %>% filter(number_of_locations != n_locations))
+
+# ================== C) Match to county (point-in-polygon) ==================
+
+# US counties (2023, generalized geometries for speed)
+us_counties <- tigris::counties(cb = TRUE, year = 2023) %>%
+  st_transform(4326) %>%
+  select(STATEFP, COUNTYFP, GEOID, NAME, geometry)
+
+# State table to attach state names and abbreviations
+states_tbl <- tigris::states(cb = TRUE, year = 2023) %>%
+  st_transform(4326) %>%
+  st_drop_geometry() %>%
+  select(STATEFP, STUSPS, STATE_NAME = NAME)
+
+us_counties <- us_counties %>%
+  left_join(states_tbl, by = "STATEFP")
+
+# Convert events to sf points
+events_sf <- labor_longloc %>%
+  filter(!is.na(event_lat), !is.na(event_lon)) %>%
+  st_as_sf(coords = c("event_lon", "event_lat"), crs = 4326, remove = FALSE)
+
+# First do a full join (including unmatched points) for diagnostics and checks
+lat_with_county_raw <- st_join(events_sf, us_counties, join = st_within) %>%
+  st_drop_geometry()
+
+# Count rows that could not be matched to any county
+n_unmatched <- sum(is.na(lat_with_county_raw$GEOID))
+cat("\nNumber of rows with invalid / out-of-bounds coordinates (no county match):",
+    n_unmatched, "\n\n")
+
+unmatched <- lat_with_county_raw %>%
+  filter(is.na(GEOID)) %>%
+  select(id, location_index, city, state, event_lat, event_lon, address, number_of_locations)
+
+# Drop rows that did not match a county and re-index locations within each id
+lat_with_county <- lat_with_county_raw %>%
+  # Keep only points successfully matched to a county
+  filter(!is.na(GEOID)) %>%
+  group_by(id) %>%
+  mutate(
+    location_index = row_number(),   # re-index valid locations
+    n_locations    = n()             # number of valid locations
+  ) %>%
+  ungroup() %>%
+  # Rename and select columns
+  rename(
+    county_fips = GEOID,
+    county_name = NAME
+  ) %>%
+  select(
+    id, location_index, n_locations,                  # expanded location indices
+    employer, labor_organization, local, industry,
+    bargaining_unit_size, number_of_locations, address, city, state, zip_code,
+    event_lat, event_lon,
+    approximate_number_of_participants, start_date, end_date,
+    duration_amount, duration_unit, strike_or_protest, is_strike,
+    authorized, worker_demands, source, notes,
+    county_fips, county_name
+  )
+
+# ================== D) Basic checks & preview ==================
+
+match_rate <- mean(!is.na(lat_with_county$county_fips))
+cat("County match success rate after dropping invalid coordinates:",
+    scales::percent(match_rate), "\n")
+
+# Preview first few rows (including county information)
+print(head(lat_with_county[, c("id", "location_index", "county_fips",
+                               "strike_or_protest", "county_name")], 10))
+
+# Save the expanded + county-matched dataset for later modeling
+saveRDS(
+  lat_with_county,
+  here("data", "processed", "lat_with_county.rds")
+)
+
+```
+We began our exploration of the data by loading in the Labor Action Tracker dataset and doing some light cleaning in order to enhance model parseability. By explicitly casting columns like start_date, end_date and numeric variables, we can ensure that the right types of data are being kept in the dataset. We further constructed a binary variable is_strike from the original field of strike_or_protest, cast industry and state as factors and kept only the first industry when multiple industries were present. We further dropped rows with missing outcomes or N/A values. 
+
+A complication we encountered is that some events list multiple locations in one row, with several latitude/longitude pairs separated by semicolons. In our code we expand these multi-location rows so that each coordinate pair becomes its own row, parse the "lat, lon" strings into numeric coordinates, and then match each point to a U.S. county using TIGER/Line shapefiles (tigris + sf). A small number of points with invalid or out-of-bounds coordinates cannot be matched to any county; we treat these as bad geocodes and drop them.
+
+We further decided to merge the Graham Institute’s Social Deprivation Index dataset in order to provide us with demographic information about the locations strikes took place in. By merging on the ZCIA level by extracting the first five digits of the LAT ZIP code (zip5) and matching them to the SDI ZCTA5_FIPS code (padded to five digits), we were able to also obtain poverty indicators that gave an indication on the relative social conditions of a given strike’s location. 
+
+Our unit of analysis is therefore **one given labor action at a given employer and start date**, with multi-location observations broken into their own rows in order to distinguish any potential geographic trends between locations. 
+
+
+
+```{r}
+#| echo: False
+#| results: hide
+# ================== Merge LAT with Social Deprivation Index ==================
+
+library(readr)
+library(stringr)
+
+# 1. Load SDI data (change the path to your own project location if needed)
+sdi_raw <- read_csv(
+  here("data", "raw", "rgcsdi-2015-2019-zcta.csv")
+)
+
+# 2. Clean SDI: convert ZCTA5_FIPS to a 5-character string and keep commonly used variables
+sdi_clean <- sdi_raw %>%
+  mutate(
+    zcta5 = str_pad(as.character(ZCTA5_FIPS), width = 5, side = "left", pad = "0")
+  ) %>%
+  select(
+    zcta5,
+    ZCTA5_population,
+    SDI_score,
+    sdi,
+    starts_with("pct_")   # percentage / proportion variables
+  )
+
+# 3. Clean ZIP in LAT: extract 5-digit ZIP and left-pad with zeros
+lat_with_sdi <- lat_with_county %>%
+  mutate(
+    zip5 = str_extract(zip_code, "\\d{5}"),
+    zip5 = str_pad(zip5, width = 5, side = "left", pad = "0")
+  ) %>%
+  # 4. Left join on zip5 ↔ zcta5 to attach SDI variables
+  left_join(sdi_clean, by = c("zip5" = "zcta5"))
+
+# 5. Quick check: share of rows that successfully matched an SDI value
+sdi_match_rate <- mean(!is.na(lat_with_sdi$SDI_score))
+cat("Share of LAT event-locations with an SDI match:",
+    round(100 * sdi_match_rate, 1), "%\n")
+
+# 6. Save the final dataset for modeling
+saveRDS(
+  lat_with_sdi,
+  here("data", "processed", "lat_with_sdi.rds")
+)
+glimpse(lat_with_sdi)
+
+```
+
+### model setup
+
+```{r}
+#| echo: False
+#| results: hide
+## ----model-setup, message=FALSE, warning=FALSE--------------------------------
+library(tidyverse)
+library(lubridate)
+library(forcats)
+library(caret)
+library(glmnet)
+library(pROC)
+library(randomForest)
+
+# 1) Construct the dataset for modeling ---------------------------------
+lat_model <- lat_with_sdi %>%
+  mutate(
+    # Duration in days
+    duration_days = duration_amount,
+    log_duration  = if_else(
+      is.na(duration_days),
+      NA_real_,
+      log1p(duration_days)
+    ),
+
+    # Participants: create a missing dummy and treat NA as 0 before log1p
+    participants_missing = is.na(approximate_number_of_participants),
+    participants_num     = if_else(
+      is.na(approximate_number_of_participants),
+      0,
+      approximate_number_of_participants
+    ),
+    log_participants = log1p(participants_num),
+
+    # Authorization: collapse NA into "Unknown"
+    authorized_flag = case_when(
+      authorized %in% c("Y", "Yes") ~ "Yes",
+      authorized %in% c("N", "No")  ~ "No",
+      TRUE                          ~ "Unknown"
+    ),
+    authorized_flag = factor(authorized_flag),
+
+    # SDI: median-impute missing values and keep a "missing" indicator
+    SDI_missing       = is.na(SDI_score),
+    SDI_score_imputed = if_else(
+      is.na(SDI_score),
+      median(SDI_score, na.rm = TRUE),
+      SDI_score
+    )
+  ) %>%
+  filter(!is.na(is_strike),
+         !is.na(start_date)) %>%
+  # Key step: collapse industries to top N + "Other" to avoid many rare categories
+  mutate(
+    industry = fct_lump_n(industry, n = 8, other_level = "Other"),
+    industry = fct_drop(industry),
+    state    = factor(state)
+  ) %>%
+  select(
+    is_strike,
+    start_date,
+    log_duration,
+    log_participants,
+    participants_missing,
+    n_locations,
+    industry,
+    state,
+    SDI_score_imputed,
+    SDI_missing,
+    authorized_flag
+  )
+
+# 2) Split by time: train+validation vs test -----------------------------
+train_val <- lat_model %>%
+  filter(start_date <= as.Date("2023-12-05"))
+
+test <- lat_model %>%
+  filter(start_date >= as.Date("2023-12-06"))
+
+# 3) Within train_val, randomly carve out validation set (stratified by class)
+set.seed(20251201)
+idx_train <- createDataPartition(train_val$is_strike, p = 0.8, list = FALSE)
+
+train <- train_val[idx_train, ]
+val   <- train_val[-idx_train, ]
+
+# Important: force factor levels in val and test to match train ----------
+train$industry <- droplevels(train$industry)
+train$state    <- droplevels(train$state)
+
+val$industry   <- factor(val$industry,   levels = levels(train$industry))
+test$industry  <- factor(test$industry,  levels = levels(train$industry))
+
+val$state      <- factor(val$state,      levels = levels(train$state))
+test$state     <- factor(test$state,     levels = levels(train$state))
+
+# Quick sanity checks
+sapply(list(train=train, val=val, test=test), nrow)
+sapply(list(train=train, val=val, test=test),
+       function(d) prop.table(table(d$is_strike)))
+
+
+
+```
+
+```{r}
+#| echo: False
+#| results: hide
+#| fig.show: hide
+## ----metrics-helper-----------------------------------------------------------
+get_metrics <- function(y_true, prob, threshold = 0.5, positive = "Strike") {
+  
+  # Turn predicted probabilities into class labels using a threshold
+  pred_class <- if_else(prob >= threshold, positive, "Protest") %>%
+    factor(levels = levels(y_true))
+  
+  cm <- caret::confusionMatrix(pred_class, y_true, positive = positive)
+  
+  # In pROC: the first level is control, the second is the positive (case)
+  neg_level <- setdiff(levels(y_true), positive)
+  
+  roc <- pROC::roc(
+    response  = y_true,
+    predictor = prob,
+    levels    = c(neg_level, positive),  # e.g., c("Protest", "Strike")
+    direction = "<",                     # higher probability = more likely to be positive
+    quiet     = TRUE                     # suppress diagnostic message
+  )
+  
+  tibble(
+    accuracy  = cm$overall["Accuracy"],
+    precision = cm$byClass["Pos Pred Value"],
+    recall    = cm$byClass["Sensitivity"],
+    F1        = cm$byClass["F1"],
+    auc       = as.numeric(pROC::auc(roc))
+  )
+}
+
+
+```
+
+#### Logistic model
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----logistic-fit-------------------------------------------------------------
+logit_fit <- glm(
+  is_strike ~ log_duration + log_participants + participants_missing +
+    n_locations + industry + state +
+    SDI_score_imputed + SDI_missing +
+    authorized_flag,
+  data   = train,
+  family = binomial()
+)
+
+# Predict strike probabilities on the validation and test sets
+val$prob_logit  <- predict(logit_fit, newdata = val,  type = "response")
+test$prob_logit <- predict(logit_fit, newdata = test, type = "response")
+
+```
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----logit-metrics------------------------------------------------------------
+# Some rows have NA predictions if there are NAs in the predictors; drop those first
+val_logit_eval  <- val  %>% dplyr::filter(!is.na(prob_logit))
+test_logit_eval <- test %>% dplyr::filter(!is.na(prob_logit))
+
+logit_val_metrics  <- get_metrics(val_logit_eval$is_strike,
+                                 val_logit_eval$prob_logit)
+logit_test_metrics <- get_metrics(test_logit_eval$is_strike,
+                                  test_logit_eval$prob_logit)
+
+combined <- bind_rows(
+  logit_val_metrics  %>% mutate(set = "Validation"),
+  logit_test_metrics %>% mutate(set = "Test")
+)
+
+kable(
+  combined,
+  digits  = 3,
+  caption = "Validation and Test Set Results for Logistic Regression"
+)
+
+
+```
+
+```{r}
+#| echo: False
+#| results: hide
+#| fig.show: hide
+## ----logit-roc-plot, fig.width=5, fig.height=4----------------------------------
+library(pROC)
+
+roc_val  <- roc(response  = val_logit_eval$is_strike,
+                predictor = val_logit_eval$prob_logit,
+                levels    = rev(levels(val_logit_eval$is_strike)))
+
+roc_test <- roc(response  = test_logit_eval$is_strike,
+                predictor = test_logit_eval$prob_logit,
+                levels    = rev(levels(test_logit_eval$is_strike)))
+
+p_roc <- ggroc(list(Validation = roc_val, Test = roc_test)) +
+  labs(
+    title = "ROC curves for logistic regression",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal()
+
+p_roc
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+#| results: hide
+#| fig.show: hide
+## ----logit-coef-vimp, message=FALSE, warning=FALSE, fig.width=6, fig.height=5--
+library(broom)
+library(forcats)
+
+coef_df <- tidy(logit_fit) %>%
+  filter(term != "(Intercept)") %>%
+  # Keep only main effects we care about + industry / state dummies
+  mutate(
+    group = case_when(
+      term %in% c("log_duration", "log_participants",
+                  "n_locations", "SDI_score_imputed") ~ "Main numeric",
+      str_detect(term, "^industry")                   ~ "Industry FE",
+      str_detect(term, "^state")                      ~ "State FE",
+      TRUE                                            ~ "Other"
+    ),
+    abs_est = abs(estimate)
+  ) %>%
+  # Take the 15 coefficients with the largest absolute values
+  slice_max(abs_est, n = 15) %>%
+  mutate(
+    term = fct_reorder(term, estimate)
+  )
+
+ggplot(coef_df, aes(x = estimate, y = term, color = group)) +
+  geom_point() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Top logistic coefficients (Strike vs. Protest)",
+    x = "Coefficient (log-odds for Strike)",
+    y = NULL,
+    color = "Group"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----logit-main-coefs-----------------------------------------------------------
+logit_main_coefs <- tidy(logit_fit) %>%
+  filter(term %in% c("log_duration",
+                     "log_participants",
+                     "participants_missingTRUE",
+                     "n_locations",
+                     "SDI_score_imputed",
+                     "SDI_missingTRUE",
+                     "authorized_flagYes",
+                     "authorized_flagUnknown"))
+
+kable(
+  logit_main_coefs,
+  digits  = 3,
+  caption = "Coefficients table for Logistic Regression"
+)
+
+```
+Our group ran 3 models in order to provide an effective comparison between them - Logistic Regression, Elastic Net and Random Forest. 
+Our logistic regression model had the predictor on column is_strike, which contains a factor variable for whether or not an observation was a strike or a protest. Coefficients we chose include the log of duration in days (log_duration), the log of the number of participants (log_participants) plus a dummy for missing participant counts (participants_missing), and the number of locations involved (n_locations). We treated industry and state as fixed effects, utilizing a category labeled “Other” to handle sparse categories, and the social deprivation index from the SDI dataset. Finally, we included a flag for whether or not the action was authorized. 
+Data was split by time: all events on or before 2023-12-05 form the training and validation pool, and events after that date form the test set. Within the pre-2023-12-06 data we take an 80/20 stratified split into training and validation sets, preserving the Strike/Protest balance. Factor levels for industry and state in the validation and test sets are aligned to the training levels to avoid “new level” errors.
+On the validation set, the logistic model achieves about 0.92 accuracy, 0.92 precision, 0.90 recall, 0.91 F1, and AUC ≈ 0.96. Performance on the test set is almost identical (accuracy ≈ 0.90, precision ≈ 0.86, recall ≈ 0.92, F1 ≈ 0.89, AUC ≈ 0.96). The ROC curves for validation and test nearly lie on top of each other and hug the top-left corner, suggesting strong out-of-sample discrimination and no obvious overfitting.
+
+#### Elastic Net Model
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----enet-fit, message=FALSE, warning=FALSE-----------------------------------
+library(glmnet)
+
+# 1) Drop rows with any NA values (glmnet does not accept NAs)
+train_glmnet <- train %>% tidyr::drop_na()
+val_glmnet   <- val   %>% tidyr::drop_na()
+test_glmnet  <- test  %>% tidyr::drop_na()
+
+# 2) Build design matrices (expand dummy variables) and remove the intercept
+x_train <- model.matrix(
+  is_strike ~ log_duration + log_participants + participants_missing +
+    n_locations + industry + state +
+    SDI_score_imputed + SDI_missing +
+    authorized_flag,
+  data = train_glmnet
+)[, -1]
+
+x_val <- model.matrix(
+  is_strike ~ log_duration + log_participants + participants_missing +
+    n_locations + industry + state +
+    SDI_score_imputed + SDI_missing +
+    authorized_flag,
+  data = val_glmnet
+)[, -1]
+
+x_test <- model.matrix(
+  is_strike ~ log_duration + log_participants + participants_missing +
+    n_locations + industry + state +
+    SDI_score_imputed + SDI_missing +
+    authorized_flag,
+  data = test_glmnet
+)[, -1]
+
+# 3) Convert outcome to 0/1 (required by glmnet)
+y_train_enet <- ifelse(train_glmnet$is_strike == "Strike", 1, 0)
+
+# 4) Use cross-validation to choose lambda
+set.seed(20251201)
+cv_enet <- cv.glmnet(
+  x      = x_train,
+  y      = y_train_enet,
+  family = "binomial",
+  alpha  = 0.5,   # Elastic Net
+  nfolds = 10
+)
+
+lambda_enet <- cv_enet$lambda.1se
+
+# 5) Predict strike probabilities on validation and test sets
+prob_enet_val  <- as.numeric(predict(cv_enet, newx = x_val,
+                                     s = lambda_enet, type = "response"))
+prob_enet_test <- as.numeric(predict(cv_enet, newx = x_test,
+                                     s = lambda_enet, type = "response"))
+
+# 6) Compute evaluation metrics
+enet_val_metrics  <- get_metrics(val_glmnet$is_strike,  prob_enet_val)
+enet_test_metrics <- get_metrics(test_glmnet$is_strike, prob_enet_test)
+
+combined <- bind_rows(
+  enet_val_metrics  %>% mutate(set = "Validation"),
+  enet_test_metrics %>% mutate(set = "Test")
+)
+
+kable(
+  combined,
+  digits  = 3,
+  caption = "Validation and Test Set Results for Logistic Regression"
+)
+
+
+```
+
+```{r}
+#| fig.show: hide
+## ----enet-roc-plot, fig.width=5, fig.height=4------------------------------
+library(pROC)
+
+roc_enet_val  <- roc(
+  response  = val_glmnet$is_strike,
+  predictor = prob_enet_val,
+  levels    = rev(levels(val_glmnet$is_strike))
+)
+
+roc_enet_test <- roc(
+  response  = test_glmnet$is_strike,
+  predictor = prob_enet_test,
+  levels    = rev(levels(test_glmnet$is_strike))
+)
+
+p_roc_enet <- ggroc(list(Validation = roc_enet_val,
+                         Test       = roc_enet_test)) +
+  labs(
+    title = "ROC curves for Elastic Net",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal()
+
+p_roc_enet
+
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+#| fig.show: hide
+## ----enet-coef-vimp, fig.width=6, fig.height=5----------------------------
+library(broom)
+library(forcats)
+
+coef_enet <- coef(cv_enet, s = lambda_enet)
+
+enet_coef_df <- tibble(
+  term     = rownames(coef_enet),
+  estimate = as.numeric(coef_enet)
+) %>%
+  filter(
+    term != "(Intercept)",
+    estimate != 0              # keep only non-zero coefficients
+  ) %>%
+  mutate(
+    group = case_when(
+      term %in% c("log_duration", "log_participants",
+                  "n_locations", "SDI_score_imputed") ~ "Main numeric",
+      str_detect(term, "^industry")                   ~ "Industry FE",
+      str_detect(term, "^state")                      ~ "State FE",
+      TRUE                                            ~ "Other"
+    ),
+    abs_est = abs(estimate),
+    term    = fct_reorder(term, estimate)
+  ) %>%
+  slice_max(abs_est, n = 15)      # take the 15 coefficients with largest absolute values
+
+ggplot(enet_coef_df, aes(x = estimate, y = term, color = group)) +
+  geom_point() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Top Elastic Net coefficients (Strike vs. Protest)",
+    x = "Coefficient (log-odds for Strike)",
+    y = NULL,
+    color = "Group"
+  ) +
+  theme_minimal()
+
+
+```
+We used the same predictors as the logistic regression to estimate an Elastic Net model. We first dropped rows with missing predictor values, expanded factor variables into dummy variables using “model.matrix()”, and then used (cv.glmnet) with (family=” binomial” and (alpha=0.5). The penalty parameter λ was selected by 10-fold cross-validation using the (lambda.1se) rule, which favors a slightly more regularized but simpler model. The Elastic Net model combines both L1 (LASSO) and L2 (Ridge) penalties, shrinking weak coefficients towards zero and allowing groups of correlated predictors to be retained together.
+
+On the validation set, the Elastic Net achieves about 0.90 accuracy and AUC ≈ 0.97. It has a very high precision, almost all observations predicted to be strikes are actually strikes, but it has a lower recall, which means that it is more conservative in labeling actions as strikes. On the test set, accuracy rises to about 0.94, AUC ≈ 0.96, and F1≈ 0.92, so performance on the test is slightly stronger than the plain logistic regression. At the chosen λ, the Elastic Net retains only around 18 non-zero coefficients, compared with around 60-70 coefficients in the unpenalized regression. Actually, the largest Elastic Net coefficients are close to our regression results: longer actions, larger numbers of participants, specific industries and states, and authorization status all increase the probability that an action is coded as a strike. Thus, the Elastic Net can act as a sparser, more regularized version of the regression that keeps the primary signal and reduces noise from many minor fixed effects.
+
+#### Random Forest
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----rf-fit, message=FALSE, warning=FALSE---------------------------------
+library(randomForest)
+library(tidyr)
+
+# Use the "complete data" version (drop rows with missing values first)
+train_rf <- train %>% tidyr::drop_na()
+val_rf   <- val   %>% tidyr::drop_na()
+test_rf  <- test  %>% tidyr::drop_na()
+
+set.seed(20251201)
+rf_fit <- randomForest(
+  is_strike ~ log_duration + log_participants + participants_missing +
+    n_locations + industry + state +
+    SDI_score_imputed + SDI_missing +
+    authorized_flag,
+  data       = train_rf,
+  ntree      = 500,   # 500 trees in the forest
+  mtry       = 3,     # at each split, randomly consider 3 candidate features
+  importance = TRUE   # store variable importance
+)
+
+# Predict strike probabilities (probability of class "Strike")
+val_rf$prob_rf  <- predict(rf_fit, newdata = val_rf,  type = "prob")[, "Strike"]
+test_rf$prob_rf <- predict(rf_fit, newdata = test_rf, type = "prob")[, "Strike"]
+
+```
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----rf-metrics-----------------------------------------------------------
+val_rf_eval  <- val_rf  %>% dplyr::filter(!is.na(prob_rf))
+test_rf_eval <- test_rf %>% dplyr::filter(!is.na(prob_rf))
+
+rf_val_metrics  <- get_metrics(val_rf_eval$is_strike,  val_rf_eval$prob_rf)
+rf_test_metrics <- get_metrics(test_rf_eval$is_strike, test_rf_eval$prob_rf)
+
+combined <- bind_rows(
+  rf_val_metrics  %>% mutate(set = "Validation"),
+  rf_test_metrics %>% mutate(set = "Test")
+)
+
+kable(
+  combined,
+  digits  = 3,
+  caption = "Validation and Test Set Results for Logistic Regression"
+)
+
+```
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----rf-roc-plot, fig.width=5, fig.height=4-------------------------------
+library(pROC)
+
+roc_rf_val <- roc(
+  response  = val_rf_eval$is_strike,
+  predictor = val_rf_eval$prob_rf,
+  levels    = rev(levels(val_rf_eval$is_strike))
+)
+
+roc_rf_test <- roc(
+  response  = test_rf_eval$is_strike,
+  predictor = test_rf_eval$prob_rf,
+  levels    = rev(levels(test_rf_eval$is_strike))
+)
+
+p_roc_rf <- ggroc(list(Validation = roc_rf_val,
+                       Test       = roc_rf_test)) +
+  labs(
+    title = "ROC curves for Random Forest",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal()
+
+p_roc_rf
+```
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----rf-vimp, message=FALSE, warning=FALSE, fig.width=6, fig.height=5----
+library(broom)
+library(forcats)
+library(ggplot2)
+library(stringr)
+
+# Extract Gini-based variable importance from the random forest object
+rf_imp <- importance(rf_fit, type = 2)  # type = 2 → MeanDecreaseGini
+
+rf_imp_df <- as_tibble(rf_imp, rownames = "variable") %>%
+  rename(mean_decrease_gini = MeanDecreaseGini) %>%
+  mutate(
+    group = case_when(
+      variable %in% c("log_duration", "log_participants",
+                      "n_locations", "SDI_score_imputed") ~ "Main numeric",
+      str_detect(variable, "^industry") ~ "Industry FE",
+      str_detect(variable, "^state")    ~ "State FE",
+      TRUE                              ~ "Other"
+    ),
+    variable = fct_reorder(variable, mean_decrease_gini)
+  ) %>%
+  slice_max(mean_decrease_gini, n = 15)
+
+ggplot(rf_imp_df,
+       aes(x = mean_decrease_gini, y = variable, color = group)) +
+  geom_point() +
+  labs(
+    title = "Random Forest variable importance",
+    x = "Mean Decrease in Gini (importance)",
+    y = NULL,
+    color = "Group"
+  ) +
+  theme_minimal()
+
+```
+Finally, we estimated a Random Forest model to explore whether allowing for flexible non-linearities and interactions could further improve predictive performance. We used the same feature set as in the regression models and trained the forest on complete cases only, with 500 trees, mtry=3 candidate variables per split, and Gini impurity as the splitting criterion, which can make the forest automatically capture complex relationships, such as threshold effects in duration or interactions between industry, state,and authorization, without manual feature engineering.
+
+On the validation set, the Random Forest is the best performing model: accuracy is about 0.94, AUC is close to 0.98, and both precision and recall are in the low 0.90s (F1 ≈ 0.93). On the test set, it also generalizes well, with accuracy around 0.94 and AUC about 0.97. The test-set ROC curve for the Random Forest lies slightly above those of the logistic and Elastic Net models, confirming that it has a small but consistent edge in pure predictive power. Variable-importance measures show that log duration, log participants, and authorization status are among the most important predictors, followed by the number of locations and a subset of industry and state indicators, with SDI and the missing-participants flag also contributing.
+
+However, Random Forest achieves this performance by trading away transparency. While we can rank predictors by importance, there is no single, easily communicated coefficient for each variable, and the effect of a given feature depends on many tree splits and interactions. This makes it difficult to answer policy-relevant questions such as “By how much does a one-day increase in duration change the odds of a strike, holding other factors fixed?” For our application the lack of interpretability remains a significant drawback.
+In contrast, the Elastic Net model balances performance and interpretability. Compared with plain logistic regression, it modestly improves test-set performance (slightly higher AUC and F1) while aggressively shrinking the coefficient vector: at the chosen λ₁se it keeps only about 18 non-zero coefficients, down from roughly 60–70 in the unregularized model. The largest Elastic Net coefficients line up with our expectations from the logistic regression, but many small, noisy fixed effects are driven to (or near) zero. This gives us a model that is nearly as accurate as the Random Forest, but with a simple structure that supports clear interpretation.
+
+### Model Comparison
+
+```{r}
+
+## ----models-compare-table, message=FALSE, warning=FALSE-----------------
+library(tidyverse)
+library(knitr)
+
+# Validation set
+val_results_tbl <- bind_rows(
+  logit_val_metrics %>% mutate(model = "Logistic regression"),
+  enet_val_metrics  %>% mutate(model = "Elastic Net"),
+  rf_val_metrics    %>% mutate(model = "Random forest")
+) %>%
+  select(model, accuracy, precision, recall, F1, auc)
+
+# Test set
+test_results_tbl <- bind_rows(
+  logit_test_metrics %>% mutate(model = "Logistic regression"),
+  enet_test_metrics  %>% mutate(model = "Elastic Net"),
+  rf_test_metrics    %>% mutate(model = "Random forest")
+) %>%
+  select(model, accuracy, precision, recall, F1, auc)
+
+kable(
+  val_results_tbl,
+  digits  = 3,
+  caption = "Validation-set performance (accuracy, precision, recall, F1, AUC)"
+)
+
+kable(
+  test_results_tbl,
+  digits  = 3,
+  caption = "Test-set performance (accuracy, precision, recall, F1, AUC)"
+)
+
+```
+
+```{r}
+#| results: hide
+## ----model-compare-complexity---------------------------------------------
+# Number of non-zero Elastic Net coefficients
+get_nonzero <- function(cvfit, s = "lambda.1se") {
+  cf <- coef(cvfit, s = s)
+  sum(cf != 0) - 1  # subtract the intercept
+}
+
+n_coef_logit <- length(coef(logit_fit)) - 1
+n_coef_enet  <- get_nonzero(cv_enet, s = lambda_enet)
+
+complexity_tbl <- tibble::tibble(
+  model = c("Logistic regression",
+            "Elastic Net (alpha = 0.5)",
+            "Random forest"),
+  complexity = c(
+    paste0(n_coef_logit, " coefficients (no regularization)"),
+    paste0(n_coef_enet,  " non-zero coefficients at lambda.1se"),
+    "500 trees, mtry = 3"
+  )
+)
+kable(
+  complexity_tbl,
+  digits  = 3,
+  caption = "Model Complexity"
+)
+
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+## ----models-compare-plot, fig.width=7, fig.height=4---------------------
+metrics_long <- bind_rows(
+  val_results_tbl  %>% mutate(dataset = "Validation"),
+  test_results_tbl %>% mutate(dataset = "Test")
+) %>%
+  pivot_longer(
+    cols = c(accuracy, precision, recall, F1, auc),
+    names_to  = "metric",
+    values_to = "value"
+  )
+
+ggplot(metrics_long,
+       aes(x = metric, y = value,
+           color = model, group = model)) +
+  geom_point(position = position_dodge(width = 0.4)) +
+  geom_line(position = position_dodge(width = 0.4)) +
+  facet_wrap(~ dataset) +
+  coord_cartesian(ylim = c(0.85, 1)) +
+  labs(
+    title = "Performance comparison across models",
+    x = NULL,
+    y = "Score"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+## ----models-roc-compare, message=FALSE, warning=FALSE,
+## ----fig.width=6, fig.height=4------------------------------------------
+library(pROC)
+
+# 1. Compute ROC curves for each model using the corresponding test data
+roc_logit_test <- roc(
+  response  = test_logit_eval$is_strike,
+  predictor = test_logit_eval$prob_logit,
+  levels    = rev(levels(test_logit_eval$is_strike))
+)
+
+roc_enet_test <- roc(
+  response  = test_glmnet$is_strike,
+  predictor = prob_enet_test,
+  levels    = rev(levels(test_glmnet$is_strike))
+)
+
+roc_rf_test <- roc(
+  response  = test_rf$is_strike,
+  predictor = test_rf$prob_rf,
+  levels    = rev(levels(test_rf$is_strike))
+)
+
+# 2. Plot all three ROC curves on the same figure
+p_roc_models <- ggroc(
+  list(
+    "Logistic"      = roc_logit_test,
+    "Elastic Net"   = roc_enet_test,
+    "Random forest" = roc_rf_test
+  )
+) +
+  labs(
+    title = "ROC curves on test set",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal()
+
+p_roc_models
+
+```
+
+```{r}
+#| results: hide
+#| fig.show: hide
+## ----enet-refit, message=FALSE, warning=FALSE---------------------------
+# Make sure Elastic Net cross-validation uses AUC as the performance metric
+set.seed(20251201)
+cv_enet <- cv.glmnet(
+  x      = x_train,
+  y      = y_train_enet,
+  family = "binomial",
+  alpha  = 0.5,          # Elastic Net
+  nfolds = 10,
+  type.measure = "auc"
+)
+
+lambda_enet <- cv_enet$lambda.1se
+
+prob_enet_val  <- as.numeric(predict(cv_enet, newx = x_val,
+                                     s = lambda_enet, type = "response"))
+prob_enet_test <- as.numeric(predict(cv_enet, newx = x_test,
+                                     s = lambda_enet, type = "response"))
+
+enet_val_metrics  <- get_metrics(val_glmnet$is_strike,  prob_enet_val)
+enet_test_metrics <- get_metrics(test_glmnet$is_strike, prob_enet_test)
+
+## ----models-summary-table, message=FALSE, warning=FALSE-----------------
+# helper: get the cross-validated AUC at lambda.1se
+get_auc_1se <- function(cvfit) {
+  idx <- which.min(abs(cvfit$lambda - cvfit$lambda.1se))
+  cvfit$cvm[idx]   # this is AUC now, because we set type.measure = "auc" above
+}
+
+# helper: count non-zero coefficients at lambda.1se (minus 1 to drop the intercept)
+count_nonzero <- function(cvfit, s = "lambda.1se") {
+  cf <- coef(cvfit, s = s)
+  sum(cf != 0) - 1
+}
+
+models_summary <- tibble(
+  model             = c("Logistic regression", "Elastic Net", "Random forest"),
+  # Only Elastic Net has lambda_1se; other models get NA (not applicable)
+  lambda_1se        = c(NA_real_,              cv_enet$lambda.1se,          NA_real_),
+  # Only Elastic Net has a CV AUC (because we tuned it with cross-validation)
+  cv_auc_1se        = c(NA_real_,              get_auc_1se(cv_enet),        NA_real_),
+  # "Effective terms": logit = number of non-zero coefficients;
+  # Elastic Net = selected features; RF = number of input variables (approx.)
+  n_effective_terms = c(
+    length(coef(logit_fit)) - 1L,   # logit: all non-zero coefficients
+    count_nonzero(cv_enet),         # Elastic Net: truly retained features
+    length(rf_fit$importance)       # RF: length of the variable-importance vector
+  ),
+  # Test-set AUC for all three models (from the earlier get_metrics outputs)
+  test_auc          = c(
+    logit_test_metrics$auc,
+    enet_test_metrics$auc,
+    rf_test_metrics$auc
+  )
+)
+
+kable(
+  models_summary,
+  digits  = 3,
+  caption = "Models Summary Table (lambda 1se, CV auc, effective terms, test set AUC"
+)
+
+```
+For these reasons, we base our policy discussion on the Elastic Net. It preserves most of the statistical power of the Random Forest while dramatically reducing model complexity and retaining the interpretability of a regression-type model. In our view, sacrificing a few hundredths of AUC in exchange for a compact set of interpretable coefficients is a better match for the research questions we care about than either the fully unregularized logistic regression or the black-box Random Forest.
+
+
+
+#### Conclusion
+Critically examining the results of our model indicates that longer actions, larger numbers of participants, specific industries and states, and authorization status serve as predictors of a strike outcome. In the context of providing policy analysis, this is a good starting point as policymakers can analyse these coefficients and determine that location, size and authorization are key factors in determining whether a labor action would develop into a strike or not. Further analysis could be done on labor laws across geographical jurisdiction to determine whether a state’s labor laws would influence strike likelihood, so these findings could translate into substantive changes to state labor codes.
